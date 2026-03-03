@@ -1,0 +1,72 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# --- dependencies ---
+**/node_modules/
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# --- Python Backend / Virtual Env ---
+# 가상환경이 어느 폴더에 있든 차단
+**/venv/
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# --- testing ---
+coverage
+
+# --- next.js ---
+# 폴더명 앞에 /를 빼야 하위 폴더의 .next도 잡힙니다.
+.next/
+out/
+build/
+
+# --- production ---
+/build
+
+# --- misc ---
+.DS_Store
+*.pem
+*.log
+.vscode/
+.idea/
+
+# --- debug ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- env files ---
+.env*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# --- vercel ---
+.vercel
+
+# --- typescript ---
+*.tsbuildinfo
+next-env.d.ts
+
+# --- AllThatPay Project Specific ---
+# PDF 원본 파일은 용량 및 보안상 제외하고, 폴더 구조만 유지합니다.
+frontend/public/sources/*
+rag/sources/*
+
+# 추가: 100MB 넘는 바이너리 파일 확장자들 원천 차단
+*.node
+*.dylib
+*.dll

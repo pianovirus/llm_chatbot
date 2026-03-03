@@ -90,7 +90,7 @@ export default function ChatPage() {
   return (
     <div className="flex flex-col h-screen max-w-2xl mx-auto p-4 bg-gray-50 text-black font-sans">
       <header className="py-4 border-b">
-        <h1 className="text-xl font-bold text-blue-600">Agentic Workflow</h1>
+        <h1 className="text-xl font-bold text-blue-600">올댓애스크</h1>
       </header>
 
       {/* 메시지 리스트 */}

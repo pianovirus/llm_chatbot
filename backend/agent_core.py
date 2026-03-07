@@ -3,19 +3,18 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
-import numpy as np
-import psycopg2 
-import psycopg2.extras 
-from pgvector.psycopg2 import register_vector 
+import re
+import psycopg2
+import psycopg2.extras
+from pgvector.psycopg2 import register_vector
 import warnings
 import ssl
 import urllib.parse
 import unicodedata
 import threading
-import time
-import mimetypes 
+import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote 
+from urllib.parse import urlparse, parse_qs, unquote
 from dotenv import load_dotenv
 
 # 1. 환경 변수 로드
@@ -24,8 +23,10 @@ warnings.filterwarnings("ignore")
 
 try:
     _create_unverified_https_context = ssl._create_unverified_context
-except AttributeError: pass
-else: ssl._create_default_https_context = _create_unverified_https_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
 
 from langchain_community.llms import Ollama
 from sentence_transformers import SentenceTransformer
@@ -35,7 +36,7 @@ MODEL_NAME = os.getenv("LLM_MODEL")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
 EMBED_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME")
 TABLE_NAME = os.getenv("DB_TABLE_NAME")
-BASE_DOCS_URL = os.getenv("BASE_DOCS_URL")
+BASE_DOCS_URL = os.getenv("BASE_DOCS_URL", "http://localhost:8000/files/")
 DB_NAME = os.getenv("DB_NAME")
 
 # PostgreSQL 연결 정보
@@ -47,9 +48,14 @@ DB_CONFIG = {
     "dbname": os.getenv("DB_NAME")
 }
 
+# ✅ 문서 서빙은 원래 방식으로 복구
+#    실행 위치 기준 storage 폴더 사용
 STORAGE_DIR = os.path.join(os.getcwd(), "storage")
 if not os.path.exists(STORAGE_DIR):
     os.makedirs(STORAGE_DIR)
+
+print(f"📁 STORAGE_DIR: {STORAGE_DIR}")
+print(f"📁 storage exists: {os.path.exists(STORAGE_DIR)}")
 
 embedding_lock = threading.Lock()
 
@@ -57,27 +63,106 @@ embedding_lock = threading.Lock()
 print(f"⏳ [System] 모델 로드 중... ({EMBED_MODEL_NAME})")
 embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0, timeout=180)
-print(f"✅ [System] PostgreSQL RAG 엔진 가동 준비 완료.")
+print("✅ [System] PostgreSQL RAG 엔진 가동 준비 완료.")
+
 
 # --- 유틸리티 함수 ---
 
+def normalize_keyword(token: str) -> str:
+    """
+    한국어 조사/어미를 아주 단순하게 제거해서 검색 키워드 품질 개선
+    """
+    if not token:
+        return ""
+
+    token = unicodedata.normalize("NFC", token.strip())
+
+    suffixes = [
+        "에서는", "으로는", "에게서", "까지는", "부터는",
+        "에서", "으로", "에게", "까지", "부터", "처럼",
+        "하고", "이며", "이고", "하면",
+        "라는", "라고", "니다", "어요", "아요",
+        "를", "을", "은", "는", "이", "가", "도", "만",
+        "와", "과", "에", "의", "로"
+    ]
+
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if len(token) > len(suffix) + 1 and token.endswith(suffix):
+            token = token[:-len(suffix)]
+            break
+
+    return token.strip()
+
+
+def extract_search_keywords(query: str, max_keywords: int = 3):
+    """
+    질문에서 의미 있는 키워드 최대 3개 추출
+    """
+    if not query:
+        return []
+
+    raw_tokens = re.findall(r"[가-힣A-Za-z0-9_-]{2,}", query)
+
+    stopwords = {
+        "방법", "문의", "관련", "설명", "기능", "화면", "문서", "가이드",
+        "알려줘", "알려", "주세요", "부탁", "어떻게", "어디", "왜", "무엇",
+        "뭐", "정도", "가능", "확인", "찾기", "찾나요", "있나요", "되나요",
+        "해주세요", "보여줘", "설정해", "설정법"
+    }
+
+    cleaned = []
+    seen = set()
+
+    for token in raw_tokens:
+        normalized = normalize_keyword(token)
+        if len(normalized) < 2:
+            continue
+        if normalized in stopwords:
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            cleaned.append(normalized)
+
+    # 긴 키워드 우선
+    cleaned = sorted(cleaned, key=lambda x: (-len(x), cleaned.index(x)))
+    return cleaned[:max_keywords]
+
+
+def build_document_url(title_val: str):
+    """
+    ✅ 원래 방식 유지: title 기반으로만 링크 생성
+    """
+    file_url_name = title_val if title_val.lower().endswith(".pdf") else f"{title_val}.pdf"
+    normalized = unicodedata.normalize("NFC", file_url_name)
+    encoded = urllib.parse.quote(normalized)
+    base_url = BASE_DOCS_URL.rstrip("/") + "/"
+    return f"{base_url}{encoded}"
+
+
 def get_internal_context(query: str):
     """
-    💡 [최종 최적화] 검색 가중치 상향 및 링크 추출 강화
+    하이브리드 검색:
+    - Vector similarity
+    - PostgreSQL FTS
+    - 제목/본문 직접 매칭 가중치
     """
     with embedding_lock:
         instruction = "Represent this sentence for searching relevant passages: "
         query_vec = embed_model.encode(instruction + query).tolist()
-    
+
+    keywords = extract_search_keywords(query, max_keywords=3)
+    k1 = keywords[0] if len(keywords) > 0 else None
+    k2 = keywords[1] if len(keywords) > 1 else None
+    k3 = keywords[2] if len(keywords) > 2 else None
+
+    print(f"\n🧩 [Keyword Extraction] query='{query}' -> keywords={keywords}")
+
     conn = None
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         register_vector(conn)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        # 💡 [수정 포인트] 
-        # 1. websearch_to_tsquery를 써서 공백/특수문자 대응
-        # 2. LIKE 연산자를 결합하여 '가상프린터'라는 글자만 있어도 점수 부여
+
         sql = f"""
             WITH vector_matches AS (
                 SELECT id, (embedding <=> %s::vector) AS dist
@@ -86,19 +171,47 @@ def get_internal_context(query: str):
                 LIMIT 50
             ),
             keyword_matches AS (
-                SELECT id, 
-                       ts_rank_cd(content_search_vector, websearch_to_tsquery('simple', %s)) AS rank
+                SELECT
+                    id,
+                    ts_rank_cd(content_search_vector, websearch_to_tsquery('simple', %s)) AS rank
                 FROM {TABLE_NAME}
-                WHERE content_search_vector @@ websearch_to_tsquery('simple', %s)
-                OR original_content LIKE '%%' || %s || '%%' -- 💡 검색어가 포함만 되어도 필터링 통과
-                LIMIT 50
+                WHERE
+                    content_search_vector @@ websearch_to_tsquery('simple', %s)
+                    OR (%s IS NOT NULL AND original_content ILIKE '%%' || %s || '%%')
+                    OR (%s IS NOT NULL AND original_content ILIKE '%%' || %s || '%%')
+                    OR (%s IS NOT NULL AND original_content ILIKE '%%' || %s || '%%')
+                    OR (%s IS NOT NULL AND title ILIKE '%%' || %s || '%%')
+                    OR (%s IS NOT NULL AND title ILIKE '%%' || %s || '%%')
+                    OR (%s IS NOT NULL AND title ILIKE '%%' || %s || '%%')
+                LIMIT 100
             )
-            SELECT 
-                t.original_content, t.title, t.source_url, t.data_source,
-                -- 💡 벡터 점수 + (키워드 점수 * 10) + (제목/본문 직접 매칭 가중치)
-                COALESCE(1.0 / (60 + v.dist * 100), 0) + 
-                COALESCE(k.rank * 10.0, 0) + 
-                (CASE WHEN t.original_content LIKE '%%' || %s || '%%' THEN 0.5 ELSE 0 END) AS combined_score
+            SELECT
+                t.original_content,
+                t.title,
+                t.source_url,
+                t.data_source,
+
+                COALESCE(1.0 / (60 + v.dist * 100), 0) +
+                COALESCE(k.rank * 10.0, 0) +
+
+                (
+                    CASE
+                        WHEN %s IS NOT NULL AND t.title ILIKE '%%' || %s || '%%' THEN 0.8
+                        WHEN %s IS NOT NULL AND t.title ILIKE '%%' || %s || '%%' THEN 0.6
+                        WHEN %s IS NOT NULL AND t.title ILIKE '%%' || %s || '%%' THEN 0.4
+                        ELSE 0
+                    END
+                ) +
+
+                (
+                    CASE
+                        WHEN %s IS NOT NULL AND t.original_content ILIKE '%%' || %s || '%%' THEN 0.5
+                        WHEN %s IS NOT NULL AND t.original_content ILIKE '%%' || %s || '%%' THEN 0.35
+                        WHEN %s IS NOT NULL AND t.original_content ILIKE '%%' || %s || '%%' THEN 0.2
+                        ELSE 0
+                    END
+                ) AS combined_score
+
             FROM {TABLE_NAME} t
             LEFT JOIN vector_matches v ON t.id = v.id
             LEFT JOIN keyword_matches k ON t.id = k.id
@@ -107,44 +220,69 @@ def get_internal_context(query: str):
             LIMIT 7;
         """
 
-        # 검색어에서 핵심 명사만 추출 (가급적 짧게)
-        search_keyword = query.split()[0]
-        
-        cursor.execute(sql, (query_vec, query, query, search_keyword, search_keyword))
+        params = (
+            query_vec,
+            query,
+            query,
+
+            k1, k1,
+            k2, k2,
+            k3, k3,
+
+            k1, k1,
+            k2, k2,
+            k3, k3,
+
+            k1, k1,
+            k2, k2,
+            k3, k3,
+
+            k1, k1,
+            k2, k2,
+            k3, k3
+        )
+
+        cursor.execute(sql, params)
         rows = cursor.fetchall()
 
         results = []
-        print(f"\n🔍 [Hybrid Search Debug] 질문: '{query}'")
+        print(f"🔍 [Hybrid Search Debug] 질문: '{query}'")
         for row in rows:
-            score = float(row['combined_score'])
+            score = float(row["combined_score"])
             print(f"   - [{row['data_source']}] {row['title']} | 통합 점수: {score:.4f}")
-            
-            # 💡 아주 낮은 관련성이 아니면 모두 결과에 포함 (0.001 이상)
+
             if score > 0.001:
-                title_val = row['title'] if row['title'] else "Unknown Document"
-                # 파일명 확장자 처리 (URL 생성용)
-                file_url_name = title_val if title_val.lower().endswith(".pdf") else f"{title_val}.pdf"
-                
-                normalized = unicodedata.normalize('NFC', file_url_name)
-                encoded = urllib.parse.quote(normalized)
-                
+                title_val = row["title"] if row["title"] else "Unknown Document"
+                url = build_document_url(title_val)
+
                 results.append({
-                    "content": row['original_content'], 
-                    "title": title_val, 
-                    "url": f"{BASE_DOCS_URL}{encoded}"
+                    "content": row["original_content"],
+                    "title": title_val,
+                    "url": url
                 })
+
         return results
+
     except Exception as err:
         print(f"❌ [DB Error] {err}")
         return []
     finally:
-        if conn: conn.close()
+        if conn:
+            conn.close()
+
 
 # --- HTTP 핸들러 ---
 
 class RAGHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status_code, payload):
+        self.send_response(status_code)
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
     def _send_sse(self, data):
-        self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8'))
+        self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8"))
         self.wfile.flush()
 
     def _send_done(self):
@@ -153,9 +291,9 @@ class RAGHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
     def serve_static_file(self, file_path):
@@ -163,118 +301,156 @@ class RAGHandler(BaseHTTPRequestHandler):
             decoded_filename = unquote(file_path)
             full_path = os.path.join(STORAGE_DIR, decoded_filename)
 
+            print("========== FILE DEBUG ==========")
+            print(f"Requested raw  : {file_path}")
+            print(f"Requested name : {decoded_filename}")
+            print(f"Full path      : {full_path}")
+            print(f"Exists?        : {os.path.exists(full_path)}")
+            print(f"Is file?       : {os.path.isfile(full_path)}")
+
             if os.path.exists(full_path) and os.path.isfile(full_path):
                 self.send_response(200)
                 mime_type, _ = mimetypes.guess_type(full_path)
-                self.send_header('Content-type', mime_type or 'application/octet-stream')
-                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header("Content-type", mime_type or "application/octet-stream")
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                with open(full_path, 'rb') as f:
+                with open(full_path, "rb") as f:
                     self.wfile.write(f.read())
             else:
+                print(f"❌ File not found: {full_path}")
                 self.send_error(404, "File Not Found")
         except Exception as e:
+            print(f"🚨 serve_static_file error: {e}")
             self.send_error(500, str(e))
 
     def do_POST(self):
         if self.path == "/feedback":
             try:
-                content_length = int(self.headers.get('Content-Length', 0))
-                data = json.loads(self.rfile.read(content_length))
-                query, answer = data.get("query"), data.get("answer")
-                if query and answer:
-                    self._save_feedback_to_db(query, answer)
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "success", "message": "성공적으로 학습되었습니다."}).encode())
+                content_length = int(self.headers.get("Content-Length", 0))
+                raw_body = self.rfile.read(content_length)
+
+                if not raw_body:
+                    self._send_json(400, {"status": "error", "message": "요청 본문이 비어 있습니다."})
+                    return
+
+                data = json.loads(raw_body)
+                query = data.get("query")
+                answer = data.get("answer")
+
+                if not query or not answer:
+                    self._send_json(400, {"status": "error", "message": "query 와 answer 는 필수입니다."})
+                    return
+
+                self._save_feedback_to_db(query, answer)
+                self._send_json(200, {"status": "success", "message": "성공적으로 학습되었습니다."})
+
             except Exception as e:
                 print(f"🚨 피드백 저장 오류: {e}")
+                self._send_json(500, {"status": "error", "message": str(e)})
 
     def do_GET(self):
         parsed_path = urlparse(self.path)
-        
+
+        # ✅ 원래 방식 복구
         if parsed_path.path.startswith("/files/"):
-            file_path = parsed_path.path[7:]
+            file_path = parsed_path.path[len("/files/"):]
             self.serve_static_file(file_path)
             return
 
         if parsed_path.path == "/search":
             params = parse_qs(parsed_path.query)
-            query = params.get('query', [''])[0]
-            if not query: return
+            query = params.get("query", [""])[0].strip()
+
+            if not query:
+                self._send_json(400, {"status": "error", "message": "query 파라미터가 필요합니다."})
+                return
 
             self.send_response(200)
-            self.send_header('Content-type', 'text/event-stream; charset=utf-8')
-            self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection', 'keep-alive')
-            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header("Content-type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
             try:
                 self._send_sse({"status": "🔍 지식 데이터 검색 중..."})
                 search_results = get_internal_context(query)
-                
+
                 if search_results:
-                    context_combined = "\n".join([f"### [데이터]: {r['content']}" for r in search_results])
-                    
+                    context_combined = "\n".join(
+                        [f"### [데이터 {i+1}]\n제목: {r['title']}\n내용: {r['content']}" for i, r in enumerate(search_results)]
+                    )
+
                     prompt = (
-                        f"당신은 기술지원 전문가입니다. 반드시 제공된 [지식 데이터]를 근거로 답변하되, "
-                        f"직접적인 절차가 없더라도 데이터 내의 메뉴명, 버튼 이름 등을 활용해 논리적으로 추론하여 안내하세요.\n"
-                        f"답변의 내용이 사용자 질문에 반드시 정확한 답이어야 합니다. 모르면 모른다고 하세요.\n"
-                        f"단, 데이터에 전혀 근거가 없는 내용은 지어내지 마세요.\n\n"
+                        f"당신은 기술지원 전문가입니다. 반드시 제공된 [지식 데이터]를 근거로 답변하세요.\n"
+                        f"직접적인 절차가 없더라도 데이터 내의 메뉴명, 버튼 이름 등을 활용해 논리적으로 추론하여 안내할 수 있습니다.\n"
+                        f"단, 데이터에 전혀 근거가 없는 내용은 지어내지 마세요.\n"
+                        f"모르면 모른다고 말하세요.\n\n"
                         f"### [지식 데이터]\n{context_combined}\n\n"
                         f"### [사용자 질문]\n{query}\n\n"
                         f"### [응답 규칙]\n"
-                        f"1. [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항] 순서 엄수.\n"
-                        f"2. 추론한 내용일 경우 '매뉴얼 기반 추론 절차입니다'라고 명시하세요.\n"
-                        f"3. 아주 상세하고 친절하게 답변할 것."
+                        f"1. 반드시 다음 순서를 지키세요: [## 📢 조치 안내] -> [### 🛠️ 상세 절차] -> [### 💡 주의 사항]\n"
+                        f"2. 추론한 내용일 경우 반드시 '매뉴얼 기반 추론 절차입니다'라고 명시하세요.\n"
+                        f"3. 아주 상세하고 친절하게 답변하세요.\n"
+                        f"4. 관련 문서 제목이나 메뉴명을 답변 중 자연스럽게 인용해도 됩니다."
                     )
-                    
+
                     self._send_sse({"status": "🧠 생각 중..."})
                     for chunk in llm.stream(prompt):
                         self._send_sse({"status": "💬 답변 중..."})
-                        if chunk: self._send_sse({"chunk": chunk})
-                    
+                        if chunk:
+                            self._send_sse({"chunk": chunk})
+
                     unique_links = {}
                     for r in search_results:
-                        if r['title'] not in unique_links:
-                            unique_links[r['title']] = r['url']
-                    
-                    valid_links_text = "\n".join([f"- [{title}]({url})" for title, url in unique_links.items()])
-                    
+                        if r["title"] not in unique_links and r["url"]:
+                            unique_links[r["title"]] = r["url"]
+
+                    valid_links_text = "\n".join(
+                        [f"- [{title}]({url})" for title, url in unique_links.items()]
+                    )
+
                     if valid_links_text:
                         self._send_sse({"chunk": "\n\n---\n### 🔗 관련 문서\n" + valid_links_text})
                 else:
                     self._send_sse({"chunk": "관련 정보를 찾지 못했습니다."})
 
                 self._send_done()
+
             except Exception as e:
                 print(f"🚨 서버 오류: {e}")
-                self._send_sse({"error": str(e)}); self._send_done()
+                self._send_sse({"error": str(e)})
+                self._send_done()
 
     def _save_feedback_to_db(self, query, answer):
         combined_text = f"질문: {query}\n전문가 답변: {answer}"
+
         with embedding_lock:
             vector = embed_model.encode(combined_text).tolist()
-        
+
         conn = None
         try:
             conn = psycopg2.connect(**DB_CONFIG)
             register_vector(conn)
             cursor = conn.cursor()
+
             sql = f"""
-                INSERT INTO {TABLE_NAME} 
-                (content_type, data_source, original_content, embedding, title, content_search_vector) 
+                INSERT INTO {TABLE_NAME}
+                (content_type, data_source, original_content, embedding, title, content_search_vector)
                 VALUES (%s, %s, %s, %s, %s, to_tsvector('simple', %s))
             """
-            cursor.execute(sql, ('text', 'feedback', combined_text, vector, '검증된 답변', combined_text))
+            cursor.execute(
+                sql,
+                ("text", "feedback", combined_text, vector, "검증된 답변", combined_text)
+            )
             conn.commit()
+
         finally:
-            if conn: conn.close()
+            if conn:
+                conn.close()
+
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(('0.0.0.0', 8000), RAGHandler)
-    print(f"📡 RAG Service 가동: http://localhost:8000")
+    server = ThreadingHTTPServer(("0.0.0.0", 8000), RAGHandler)
+    print("📡 RAG Service 가동: http://localhost:8000")
     server.serve_forever()

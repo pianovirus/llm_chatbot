@@ -1,7 +1,8 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
+  /* 💡 보내주신 이미지의 연회색 패턴 색상으로 변경했습니다. */
+  --background: #ECEDEF; 
   --foreground: #171717;
 }
 
@@ -12,9 +13,10 @@
   --font-mono: var(--font-geist-mono);
 }
 
+/* 💡 다크모드에서도 너무 검은색보다는 일관성을 유지하도록 설정했습니다. */
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
+    --background: #e2e3e4; /* 다크모드용 톤다운된 회색 */
     --foreground: #ededed;
   }
 }
@@ -23,4 +25,6 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+  /* 부드러운 전환 효과를 위해 추가 (선택사항) */
+  transition: background-color 0.3s ease;
 }

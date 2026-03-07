@@ -30,7 +30,7 @@ class RAGIngestionLight:
         
         # 💡 청크 사이즈 최적화: 500은 문맥이 자주 끊겨서 800으로 상향했습니다.
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,       
+            chunk_size=500,       
             chunk_overlap=150,     
             length_function=len,
             separators=["\n\n", "\n", "---", ". ", " ", ""]

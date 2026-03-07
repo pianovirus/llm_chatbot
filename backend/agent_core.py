@@ -57,17 +57,15 @@ embedding_lock = threading.Lock()
 print(f"⏳ [System] 모델 로드 중... ({EMBED_MODEL_NAME})")
 embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0, timeout=180)
-print(f"✅ [System] PostgreSQL 하이브리드 RAG 엔진 가동 준비 완료.")
+print(f"✅ [System] PostgreSQL RAG 엔진 가동 준비 완료.")
 
 # --- 유틸리티 함수 ---
 
 def get_internal_context(query: str):
     """
-    💡 [최적화] 하이브리드 검색 (벡터 유사도 + 키워드 일치)
-    RRF(Reciprocal Rank Fusion) 알고리즘을 사용하여 두 검색 결과의 순위를 통합합니다.
+    💡 [최종 최적화] 검색 가중치 상향 및 링크 추출 강화
     """
     with embedding_lock:
-        # BGE 모델 특성상 지시문 포함
         instruction = "Represent this sentence for searching relevant passages: "
         query_vec = embed_model.encode(instruction + query).tolist()
     
@@ -77,52 +75,64 @@ def get_internal_context(query: str):
         register_vector(conn)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # 💡 하이브리드 검색 SQL: 벡터 검색과 키워드(to_tsquery) 검색을 결합
-        # - 벡터: <=> 연산자 (Cosine Distance)
-        # - 키워드: ts_rank (키워드 빈도 및 근접도 점수)
+        # 💡 [수정 포인트] 
+        # 1. websearch_to_tsquery를 써서 공백/특수문자 대응
+        # 2. LIKE 연산자를 결합하여 '가상프린터'라는 글자만 있어도 점수 부여
         sql = f"""
             WITH vector_matches AS (
                 SELECT id, (embedding <=> %s::vector) AS dist
                 FROM {TABLE_NAME}
                 ORDER BY dist ASC
-                LIMIT 20
+                LIMIT 50
             ),
             keyword_matches AS (
-                SELECT id, ts_rank(content_search_vector, plainto_tsquery('simple', %s)) AS rank
+                SELECT id, 
+                       ts_rank_cd(content_search_vector, websearch_to_tsquery('simple', %s)) AS rank
                 FROM {TABLE_NAME}
-                WHERE content_search_vector @@ plainto_tsquery('simple', %s)
-                ORDER BY rank DESC
-                LIMIT 20
+                WHERE content_search_vector @@ websearch_to_tsquery('simple', %s)
+                OR original_content LIKE '%%' || %s || '%%' -- 💡 검색어가 포함만 되어도 필터링 통과
+                LIMIT 50
             )
             SELECT 
                 t.original_content, t.title, t.source_url, t.data_source,
-                COALESCE(1.0 / (60 + v.dist * 100), 0) + COALESCE(k.rank, 0) AS combined_score
+                -- 💡 벡터 점수 + (키워드 점수 * 10) + (제목/본문 직접 매칭 가중치)
+                COALESCE(1.0 / (60 + v.dist * 100), 0) + 
+                COALESCE(k.rank * 10.0, 0) + 
+                (CASE WHEN t.original_content LIKE '%%' || %s || '%%' THEN 0.5 ELSE 0 END) AS combined_score
             FROM {TABLE_NAME} t
             LEFT JOIN vector_matches v ON t.id = v.id
             LEFT JOIN keyword_matches k ON t.id = k.id
             WHERE v.id IS NOT NULL OR k.id IS NOT NULL
-            ORDER BY (CASE WHEN t.data_source = 'feedback' THEN 0 ELSE 1 END) ASC, combined_score DESC
+            ORDER BY combined_score DESC
             LIMIT 7;
         """
+
+        # 검색어에서 핵심 명사만 추출 (가급적 짧게)
+        search_keyword = query.split()[0]
         
-        # plainto_tsquery를 사용해 일반 문장을 검색어 쿼리로 변환합니다.
-        cursor.execute(sql, (query_vec, query, query))
+        cursor.execute(sql, (query_vec, query, query, search_keyword, search_keyword))
         rows = cursor.fetchall()
-        
+
         results = []
         print(f"\n🔍 [Hybrid Search Debug] 질문: '{query}'")
         for row in rows:
-            print(f"   - [{row['data_source']}] {row['title']} | 점수: {row['combined_score']:.4f}")
+            score = float(row['combined_score'])
+            print(f"   - [{row['data_source']}] {row['title']} | 통합 점수: {score:.4f}")
             
-            source_url = row['source_url'] if row['source_url'] else ""
-            normalized = unicodedata.normalize('NFC', source_url)
-            encoded = urllib.parse.quote(normalized)
-            
-            results.append({
-                "content": row['original_content'], 
-                "title": row['title'], 
-                "url": f"{BASE_DOCS_URL}{encoded}" if source_url else "#"
-            })
+            # 💡 아주 낮은 관련성이 아니면 모두 결과에 포함 (0.001 이상)
+            if score > 0.001:
+                title_val = row['title'] if row['title'] else "Unknown Document"
+                # 파일명 확장자 처리 (URL 생성용)
+                file_url_name = title_val if title_val.lower().endswith(".pdf") else f"{title_val}.pdf"
+                
+                normalized = unicodedata.normalize('NFC', file_url_name)
+                encoded = urllib.parse.quote(normalized)
+                
+                results.append({
+                    "content": row['original_content'], 
+                    "title": title_val, 
+                    "url": f"{BASE_DOCS_URL}{encoded}"
+                })
         return results
     except Exception as err:
         print(f"❌ [DB Error] {err}")
@@ -212,6 +222,7 @@ class RAGHandler(BaseHTTPRequestHandler):
                     prompt = (
                         f"당신은 기술지원 전문가입니다. 반드시 제공된 [지식 데이터]를 근거로 답변하되, "
                         f"직접적인 절차가 없더라도 데이터 내의 메뉴명, 버튼 이름 등을 활용해 논리적으로 추론하여 안내하세요.\n"
+                        f"답변의 내용이 사용자 질문에 반드시 정확한 답이어야 합니다. 모르면 모른다고 하세요.\n"
                         f"단, 데이터에 전혀 근거가 없는 내용은 지어내지 마세요.\n\n"
                         f"### [지식 데이터]\n{context_combined}\n\n"
                         f"### [사용자 질문]\n{query}\n\n"
@@ -224,11 +235,18 @@ class RAGHandler(BaseHTTPRequestHandler):
                     for chunk in llm.stream(prompt):
                         if chunk: self._send_sse({"chunk": chunk})
                     
-                    valid_links = list(set([f"- [{r['title']}]({r['url']})" for r in search_results if r['url'] != "#"]))
-                    if valid_links:
-                        self._send_sse({"chunk": "\n\n---\n### 🔗 관련 문서\n" + "\n".join(valid_links)})
+                    # 💡 [링크 생성 로직] 중복 제거 및 유효 링크 생성 강화
+                    unique_links = {}
+                    for r in search_results:
+                        if r['title'] not in unique_links:
+                            unique_links[r['title']] = r['url']
+                    
+                    valid_links_text = "\n".join([f"- [{title}]({url})" for title, url in unique_links.items()])
+                    
+                    if valid_links_text:
+                        self._send_sse({"chunk": "\n\n---\n### 🔗 관련 문서\n" + valid_links_text})
                 else:
-                    self._send_sse({"chunk": "관련 정보를 찾지 못했습니다. 일반 지식으로 답변해 드릴까요?"})
+                    self._send_sse({"chunk": "관련 정보를 찾지 못했습니다."})
 
                 self._send_done()
             except Exception as e:
@@ -236,9 +254,6 @@ class RAGHandler(BaseHTTPRequestHandler):
                 self._send_sse({"error": str(e)}); self._send_done()
 
     def _save_feedback_to_db(self, query, answer):
-        """
-        💡 [피드백 저장 시 하이브리드 검색 컬럼 대응]
-        """
         combined_text = f"질문: {query}\n전문가 답변: {answer}"
         with embedding_lock:
             vector = embed_model.encode(combined_text).tolist()
@@ -248,7 +263,6 @@ class RAGHandler(BaseHTTPRequestHandler):
             conn = psycopg2.connect(**DB_CONFIG)
             register_vector(conn)
             cursor = conn.cursor()
-            # 💡 content_search_vector(tsvector)를 함께 저장
             sql = f"""
                 INSERT INTO {TABLE_NAME} 
                 (content_type, data_source, original_content, embedding, title, content_search_vector) 
@@ -261,5 +275,5 @@ class RAGHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer(('0.0.0.0', 8000), RAGHandler)
-    print(f"📡 하이브리드 RAG Service 가동: http://localhost:8000")
+    print(f"📡 RAG Service 가동: http://localhost:8000")
     server.serve_forever()

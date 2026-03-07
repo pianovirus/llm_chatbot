@@ -60,7 +60,9 @@ Docker: Dockerfile을 만들어 컨테이너로 배포합니다.
 ```
 docker exec -it pg-vector psql -U myuser -d llm_chatbot
 
-TRUNCATE TABLE rag_vectors;
+\c llm_chatbot;
+
+truncate table rag_vectors;
 ```
 
 

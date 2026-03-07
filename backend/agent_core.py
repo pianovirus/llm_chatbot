@@ -232,10 +232,11 @@ class RAGHandler(BaseHTTPRequestHandler):
                         f"3. 아주 상세하고 친절하게 답변할 것."
                     )
                     
+                    self._send_sse({"status": "🧠 생각 중..."})
                     for chunk in llm.stream(prompt):
+                        self._send_sse({"status": "💬 답변 중..."})
                         if chunk: self._send_sse({"chunk": chunk})
                     
-                    # 💡 [링크 생성 로직] 중복 제거 및 유효 링크 생성 강화
                     unique_links = {}
                     for r in search_results:
                         if r['title'] not in unique_links:

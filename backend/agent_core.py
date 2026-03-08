@@ -13,6 +13,8 @@ import urllib.parse
 import unicodedata
 import threading
 import mimetypes
+import time
+from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 from dotenv import load_dotenv
@@ -29,7 +31,7 @@ else:
     ssl._create_default_https_context = _create_unverified_https_context
 
 from langchain_community.llms import Ollama
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # 2. .env 설정값 로드
 MODEL_NAME = os.getenv("LLM_MODEL")
@@ -38,6 +40,15 @@ EMBED_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME")
 TABLE_NAME = os.getenv("DB_TABLE_NAME")
 BASE_DOCS_URL = os.getenv("BASE_DOCS_URL", "http://localhost:8000/files/")
 DB_NAME = os.getenv("DB_NAME")
+
+# Reranker 설정
+RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() == "true"
+RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
+RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "5"))
+RERANK_CANDIDATE_LIMIT = int(os.getenv("RERANK_CANDIDATE_LIMIT", "20"))
+
+# 같은 문서(title)에서 최종 후보로 허용할 최대 chunk 수
+MAX_CHUNKS_PER_TITLE = int(os.getenv("MAX_CHUNKS_PER_TITLE", "2"))
 
 # PostgreSQL 연결 정보
 DB_CONFIG = {
@@ -48,8 +59,7 @@ DB_CONFIG = {
     "dbname": os.getenv("DB_NAME")
 }
 
-# ✅ 문서 서빙은 원래 방식으로 복구
-#    실행 위치 기준 storage 폴더 사용
+# ✅ 문서 서빙은 원래 방식 유지
 STORAGE_DIR = os.path.join(os.getcwd(), "storage")
 if not os.path.exists(STORAGE_DIR):
     os.makedirs(STORAGE_DIR)
@@ -58,10 +68,22 @@ print(f"📁 STORAGE_DIR: {STORAGE_DIR}")
 print(f"📁 storage exists: {os.path.exists(STORAGE_DIR)}")
 
 embedding_lock = threading.Lock()
+rerank_lock = threading.Lock()
 
 # 3. 모델 로드
-print(f"⏳ [System] 모델 로드 중... ({EMBED_MODEL_NAME})")
+print(f"⏳ [System] 임베딩 모델 로드 중... ({EMBED_MODEL_NAME})")
 embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+
+reranker = None
+if RERANK_ENABLED:
+    try:
+        print(f"⏳ [System] Reranker 모델 로드 중... ({RERANK_MODEL_NAME})")
+        reranker = CrossEncoder(RERANK_MODEL_NAME)
+        print("✅ [System] Reranker 모델 로드 완료.")
+    except Exception as e:
+        print(f"❌ [System] Reranker 로드 실패: {e}")
+        reranker = None
+
 llm = Ollama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0, timeout=180)
 print("✅ [System] PostgreSQL RAG 엔진 가동 준비 완료.")
 
@@ -139,12 +161,75 @@ def build_document_url(title_val: str):
     return f"{base_url}{encoded}"
 
 
+def limit_results_per_title(results: list, max_per_title: int = 2):
+    """
+    같은 문서(title)가 너무 많이 상위 결과를 차지하지 않도록 제한
+    """
+    limited = []
+    counter = defaultdict(int)
+
+    for item in results:
+        title = item.get("title", "Unknown Document")
+        if counter[title] < max_per_title:
+            limited.append(item)
+            counter[title] += 1
+
+    print(f"📚 [Dedup] title당 최대 {max_per_title}개 유지 -> {len(results)}개 중 {len(limited)}개 사용")
+    return limited
+
+
+def rerank_results(query: str, results: list, top_n: int = 5):
+    """
+    1차 검색 결과를 CrossEncoder reranker로 재정렬
+    """
+    if not results:
+        return results
+
+    # reranker 비활성화 또는 로드 실패 시 그대로 상위 N개만 사용
+    if not RERANK_ENABLED or reranker is None:
+        return results[:top_n]
+
+    try:
+        pairs = []
+        for r in results:
+            # 제목 + 본문을 함께 넣어 relevance 판별
+            text = f"{r.get('title', '')}\n{r.get('content', '')}"
+            pairs.append((query, text))
+
+        with rerank_lock:
+            scores = reranker.predict(pairs)
+
+        reranked = []
+        for r, score in zip(results, scores):
+            item = dict(r)
+            item["rerank_score"] = float(score)
+            reranked.append(item)
+
+        reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+        print(f"🔁 [Reranker] top_n={top_n}")
+        for i, item in enumerate(reranked[:top_n], 1):
+            print(
+                f"   {i}. {item.get('title', 'Unknown')} | "
+                f"rerank_score={item.get('rerank_score', 0):.4f} | "
+                f"combined_score={item.get('combined_score', 0):.4f}"
+            )
+
+        return reranked[:top_n]
+
+    except Exception as e:
+        print(f"❌ [Reranker Error] {e}")
+        return results[:top_n]
+
+
 def get_internal_context(query: str):
     """
     하이브리드 검색:
     - Vector similarity
     - PostgreSQL FTS
     - 제목/본문 직접 매칭 가중치
+    - 문서 중복 제한
+    - Reranker 재정렬
     """
     with embedding_lock:
         instruction = "Represent this sentence for searching relevant passages: "
@@ -217,7 +302,7 @@ def get_internal_context(query: str):
             LEFT JOIN keyword_matches k ON t.id = k.id
             WHERE v.id IS NOT NULL OR k.id IS NOT NULL
             ORDER BY combined_score DESC
-            LIMIT 7;
+            LIMIT {RERANK_CANDIDATE_LIMIT};
         """
 
         params = (
@@ -258,8 +343,16 @@ def get_internal_context(query: str):
                 results.append({
                     "content": row["original_content"],
                     "title": title_val,
-                    "url": url
+                    "url": url,
+                    "combined_score": score,
+                    "data_source": row.get("data_source"),
                 })
+
+        # 같은 title 중복 제한
+        results = limit_results_per_title(results, max_per_title=MAX_CHUNKS_PER_TITLE)
+
+        # reranker 적용
+        results = rerank_results(query, results, top_n=RERANK_TOP_N)
 
         return results
 
@@ -288,6 +381,16 @@ class RAGHandler(BaseHTTPRequestHandler):
     def _send_done(self):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
+
+    def _send_heartbeat(self):
+        """
+        프론트 연결 유지용 heartbeat
+        """
+        try:
+            self.wfile.write(b": keep-alive\n\n")
+            self.wfile.flush()
+        except Exception as e:
+            print(f"⚠️ heartbeat send failed: {e}")
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -351,7 +454,7 @@ class RAGHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urlparse(self.path)
 
-        # ✅ 원래 방식 복구
+        # ✅ 원래 방식 유지
         if parsed_path.path.startswith("/files/"):
             file_path = parsed_path.path[len("/files/"):]
             self.serve_static_file(file_path)
@@ -374,12 +477,20 @@ class RAGHandler(BaseHTTPRequestHandler):
 
             try:
                 self._send_sse({"status": "🔍 지식 데이터 검색 중..."})
+                self._send_heartbeat()
+
                 search_results = get_internal_context(query)
+
+                self._send_sse({"status": "📚 검색 결과 정리 중..."})
+                self._send_heartbeat()
 
                 if search_results:
                     context_combined = "\n".join(
                         [f"### [데이터 {i+1}]\n제목: {r['title']}\n내용: {r['content']}" for i, r in enumerate(search_results)]
                     )
+
+                    self._send_sse({"status": "📝 답변 프롬프트 준비 중..."})
+                    self._send_heartbeat()
 
                     prompt = (
                         f"당신은 기술지원 전문가입니다. 반드시 제공된 [지식 데이터]를 근거로 답변하세요.\n"
@@ -395,8 +506,16 @@ class RAGHandler(BaseHTTPRequestHandler):
                         f"4. 관련 문서 제목이나 메뉴명을 답변 중 자연스럽게 인용해도 됩니다."
                     )
 
-                    self._send_sse({"status": "🧠 생각 중..."})
+                    self._send_sse({"status": "🤖 LLM 응답 생성 시작..."})
+                    self._send_heartbeat()
+
+                    last_ping = time.time()
                     for chunk in llm.stream(prompt):
+                        now = time.time()
+                        if now - last_ping > 5:
+                            self._send_heartbeat()
+                            last_ping = now
+
                         self._send_sse({"status": "💬 답변 중..."})
                         if chunk:
                             self._send_sse({"chunk": chunk})

@@ -285,6 +285,7 @@ class RAGHandler(BaseHTTPRequestHandler):
                 self._send_sse({"status": "🧠🔗⚙️ 질문 요약 중..."})
                 state = {"original_query": query}
                 for update in rag_pipeline.stream(state, stream_mode="updates"):
+                    self._send_sse({"status": "🔍 검색 중..."})
                     for node, out in update.items():
                         state.update(out)
                         if node == "retrieve_context": self._send_sse({"status": f"🔍 검색 완료 ({len(state['search_results'])}건)"})

@@ -140,10 +140,12 @@ def create_rag_pipeline():
     graph.add_node("rewrite_query", rewrite_query_node)
     graph.add_node("retrieve_context", retrieve_context_node)
     graph.add_node("prepare_prompt", prepare_prompt_node)
+
     graph.add_edge(START, "rewrite_query")
     graph.add_edge("rewrite_query", "retrieve_context")
     graph.add_edge("retrieve_context", "prepare_prompt")
     graph.add_edge("prepare_prompt", END)
+    
     return graph.compile()
 
 rag_pipeline = create_rag_pipeline()

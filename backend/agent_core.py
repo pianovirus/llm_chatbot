@@ -282,15 +282,17 @@ class RAGHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query).get("query", [""])[0].strip()
             self.send_response(200); self.send_header("Content-type", "text/event-stream; charset=utf-8"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
             try:
+                self._send_sse({"status": "🧠🔗⚙️ 질문 요약 중..."})
                 state = {"original_query": query}
                 for update in rag_pipeline.stream(state, stream_mode="updates"):
                     for node, out in update.items():
                         state.update(out)
                         if node == "retrieve_context": self._send_sse({"status": f"🔍 검색 완료 ({len(state['search_results'])}건)"})
                 
-                self._send_sse({"status": "💬 답변 생성 중..."})
+                self._send_sse({"status": "🤖✨ 답변 생성 중..."})
                 # 🚀 스트리밍 시작 (llm_chain 사용으로 모델 독립적 처리)
                 for chunk in llm_chain.stream(state["prompt"]):
+                    self._send_sse({"status": "💬✍️ 답변 중..."})
                     if chunk: self._send_sse({"chunk": chunk})
                 
                 if state.get("doc_links"):

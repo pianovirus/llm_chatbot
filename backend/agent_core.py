@@ -47,7 +47,6 @@ from pipeline import create_rag_pipeline
 #  - make_handler(...) 로 main에서 의존성을 주입해 Handler 클래스를 생성
 from server import make_handler
 
-
 # ------------------------------------------------------------
 # 2) 런타임 안전장치: Mac tokenizers 병렬/경고/SSL 설정
 # ------------------------------------------------------------
@@ -69,7 +68,6 @@ except AttributeError:
 else:
     ssl._create_default_https_context = _create_unverified_https_context
 
-
 # ------------------------------------------------------------
 # 3) AI/ML 라이브러리 import (모델 초기화에 필요)
 # ------------------------------------------------------------
@@ -89,14 +87,12 @@ from langchain_core.output_parsers import StrOutputParser
 # - CrossEncoder: (옵션) 검색 결과 rerank
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
-
 # ------------------------------------------------------------
 # 4) 로컬 파일 서빙 디렉토리 준비 (/files 라우팅에서 사용)
 # ------------------------------------------------------------
 # server.py의 /files/<filename> 요청이 들어오면 이 폴더에서 파일을 읽어 반환
 STORAGE_DIR = os.path.join(os.getcwd(), "storage")
 os.makedirs(STORAGE_DIR, exist_ok=True)
-
 
 # ------------------------------------------------------------
 # 5) 멀티스레드 락 (ThreadingHTTPServer 동시 요청 대비)
@@ -107,7 +103,6 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 embedding_lock = threading.Lock()
 rerank_lock = threading.Lock()
 llm_lock = threading.Lock()
-
 
 # ------------------------------------------------------------
 # 6) LLM Factory: 환경설정(LLM_PROVIDER)에 따라 LLM 선택/생성
@@ -142,89 +137,90 @@ def get_llm():
         timeout=180,
     )
 
-
 # ------------------------------------------------------------
 # 7) 모델 초기화 (프로세스 시작 시 1회)
 # ------------------------------------------------------------
-# (1) Embedding 모델 로드: 문서/질문을 벡터로 바꾸는 역할
-print(f"⏳ [System] 임베딩 모델 로드 중... ({EMBED_MODEL_NAME})")
-embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+def init_models():
+    """
+    (역할) 모델을 1회 초기화하고 필요한 객체들을 반환.
+    - Embedding / (옵션) Reranker / LLM / LLM Chain
+    """
+    # (1) Embedding 모델 로드: 문서/질문을 벡터로 바꾸는 역할
+    print(f"⏳ [System] 임베딩 모델 로드 중... ({EMBED_MODEL_NAME})")
+    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 
-# (2) Reranker 모델 로드(옵션): 검색 결과를 더 좋은 순서로 재정렬
-reranker = None
-if RERANK_ENABLED:
-    try:
-        print(f"⏳ [System] Reranker 모델 로드 중... ({RERANK_MODEL_NAME})")
-        reranker = CrossEncoder(RERANK_MODEL_NAME)
-    except Exception as e:
-        # reranker는 옵션이라 실패해도 서버는 동작할 수 있게 함
-        print(f"❌ Reranker 로드 실패: {e}")
-        reranker = None
+    # (2) Reranker 모델 로드(옵션): 검색 결과를 더 좋은 순서로 재정렬
+    reranker = None
+    if RERANK_ENABLED:
+        try:
+            print(f"⏳ [System] Reranker 모델 로드 중... ({RERANK_MODEL_NAME})")
+            reranker = CrossEncoder(RERANK_MODEL_NAME)
+        except Exception as e:
+            # reranker는 옵션이라 실패해도 서버는 동작할 수 있게 함
+            print(f"❌ Reranker 로드 실패: {e}")
+            reranker = None
 
-# (3) LLM 로드 + 문자열 파서 체인 구성
-llm = get_llm()
-llm_chain = llm | StrOutputParser()
+    # (3) LLM 로드 + 문자열 파서 체인 구성
+    llm = get_llm()
+    llm_chain = llm | StrOutputParser()
 
-# (4) 부팅 상태 출력
-print("✅ [System] PostgreSQL RAG 엔진 가동 준비 완료.")
-print("=" * 50)
-print(f"현재 선택된 공급자: {LLM_PROVIDER}")
-print(f"현재 선택된 모델명: {MODEL_NAME}")
-print(f"실제 생성된 객체 타입: {type(llm)}")
-print("=" * 50)
+    # (4) 부팅 상태 출력
+    print("✅ [System] PostgreSQL RAG 엔진 가동 준비 완료.")
+    print("=" * 50)
+    print(f"현재 선택된 공급자: {LLM_PROVIDER}")
+    print(f"현재 선택된 모델명: {MODEL_NAME}")
+    print(f"실제 생성된 객체 타입: {type(llm)}")
+    print("=" * 50)
 
+    return embed_model, reranker, llm, llm_chain
 
 # ------------------------------------------------------------
-# 8) Retrieval 주입 파라미터 빌더
+# 8) agent_core 실행 진입점
 # ------------------------------------------------------------
-# retrieval.get_internal_context(query, **kwargs) 형태로 매번 동일한 kwargs를 주입하기 위한 함수
-# - config의 값 + main에서 초기화한 모델/락을 합쳐서 하나의 dict로 만든다.
-def build_retrieval_kwargs():
-    return dict(
-        # 임베딩 모델/락
-        embed_model=embed_model,
-        embedding_lock=embedding_lock,
+def main():
+    """
+    (역할) agent_core 실행 진입 함수
+    - 테스트/재사용/가독성을 위해 부팅 로직을 main()으로 감쌈
+    - 동작은 기존과 동일: 파이프라인 조립 후 HTTP 서버 실행
+    """
+    # 1) 모델 초기화
+    embed_model, reranker, llm, llm_chain = init_models()
 
-        # DB 연결/테이블/문서 URL
-        db_config=DB_CONFIG,
-        table_name=TABLE_NAME,
-        base_docs_url=BASE_DOCS_URL,
+    # 2) Retrieval 주입 파라미터 빌더
+    def build_retrieval_kwargs():
+        return dict(
+            # 임베딩 모델/락
+            embed_model=embed_model,
+            embedding_lock=embedding_lock,
 
-        # 검색 결과 조절(제한/리랭크)
-        max_chunks_per_title=MAX_CHUNKS_PER_TITLE,
-        rerank_candidate_limit=RERANK_CANDIDATE_LIMIT,
-        rerank_top_n=RERANK_TOP_N,
+            # DB 연결/테이블/문서 URL
+            db_config=DB_CONFIG,
+            table_name=TABLE_NAME,
+            base_docs_url=BASE_DOCS_URL,
 
-        # rerank 옵션 + 모델/락
-        rerank_enabled=RERANK_ENABLED,
-        reranker=reranker,
-        rerank_lock=rerank_lock,
+            # 검색 결과 조절(제한/리랭크)
+            max_chunks_per_title=MAX_CHUNKS_PER_TITLE,
+            rerank_candidate_limit=RERANK_CANDIDATE_LIMIT,
+            rerank_top_n=RERANK_TOP_N,
+
+            # rerank 옵션 + 모델/락
+            rerank_enabled=RERANK_ENABLED,
+            reranker=reranker,
+            rerank_lock=rerank_lock,
+        )
+
+    # 3) RAG Pipeline 조립 (LangGraph)
+    rag_pipeline = create_rag_pipeline(
+        llm=llm,
+        llm_lock=llm_lock,
+        query_rewrite_enabled=QUERY_REWRITE_ENABLED,
+        get_internal_context_fn=get_internal_context,
+        retrieval_kwargs_builder=build_retrieval_kwargs,
     )
 
-
-# ------------------------------------------------------------
-# 9) RAG Pipeline 조립 (LangGraph)
-# ------------------------------------------------------------
-# pipeline.py 내부에서
-#  - rewrite(옵션) -> retrieve(retrieval.py) -> prepare(prompt 조립)
-# 을 구성하고 compile() 한 runnable graph를 반환함
-rag_pipeline = create_rag_pipeline(
-    llm=llm,
-    llm_lock=llm_lock,
-    query_rewrite_enabled=QUERY_REWRITE_ENABLED,
-    get_internal_context_fn=get_internal_context,
-    retrieval_kwargs_builder=build_retrieval_kwargs,
-)
-
-
-# ------------------------------------------------------------
-# 10) 서버 실행 (HTTP)
-# ------------------------------------------------------------
-if __name__ == "__main__":
+    # 4) 서버 실행
     print(f"📡 {LLM_PROVIDER.upper()} 기반 RAG 가동: http://localhost:8000")
 
-    # server.py에 의존성 주입해서 Handler 클래스를 생성
-    # - server.py는 main을 import하지 않게 설계(순환 import 방지)
     Handler = make_handler(
         storage_dir=STORAGE_DIR,
         rag_pipeline=rag_pipeline,
@@ -239,5 +235,10 @@ if __name__ == "__main__":
         llm_provider=LLM_PROVIDER,
     )
 
-    # 멀티스레드 HTTP 서버 실행
     ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+
+# ------------------------------------------------------------
+# 9) 실제 실행
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    main()

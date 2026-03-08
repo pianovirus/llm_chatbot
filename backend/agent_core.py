@@ -73,6 +73,7 @@ llm_lock = threading.Lock()
 # 6) LLM Factory
 # - 환경변수(LLM_PROVIDER)에 따라 Gemini/OpenAI/Ollama 중 하나 선택
 # =========================================================
+# (역할) 환경설정에 따라 LLM 객체를 생성하는 팩토리 함수
 def get_llm():
     """설정된 프로바이더에 따라 LLM 인스턴스를 생성합니다."""
     temp = 0
@@ -136,10 +137,12 @@ class PipelineState(TypedDict, total=False):
 # =========================================================
 # 9) 텍스트 유틸: 검색 품질을 조금이라도 높이기 위한 전처리
 # =========================================================
+# (역할) 텍스트를 한 줄로 정리 (개행/연속 공백 제거)
 def safe_single_line(text: str) -> str:
     """텍스트를 한 줄로 정리(연속 공백/개행 제거)."""
     return " ".join(text.strip().split()) if text else ""
 
+# (역할) 한국어 조사/어미를 간단 규칙으로 제거해 검색용 키워드 정규화
 def normalize_keyword(token: str) -> str:
     """
     한국어 조사/어미 비슷한 접미를 제거해서 검색 키워드를 정리.
@@ -160,6 +163,7 @@ def normalize_keyword(token: str) -> str:
             break
     return token.strip()
 
+# (역할) 특수문자/공백 제거한 compact query 생성 (phrase 매칭용)
 def make_compact_query(query: str) -> str:
     """특수문자 제거 + 공백 제거 → 붙여쓴 형태의 compact 문자열 생성."""
     if not query:
@@ -167,6 +171,7 @@ def make_compact_query(query: str) -> str:
     q = re.sub(r"[\"'`“”‘’()\[\]{}:;,./\\!?@#$%^&*+=|<>~-]+", " ", safe_single_line(query))
     return q.replace(" ", "")
 
+# (역할) 원문/compact/토큰 결합 등 다양한 phrase 후보 생성
 def generate_phrase_candidates(query: str) -> Dict[str, str]:
     """
     검색에 활용할 phrase 후보 생성.
@@ -192,6 +197,7 @@ def generate_phrase_candidates(query: str) -> Dict[str, str]:
         "triple_phrase": "".join(normalized[:3]),
     }
 
+# (역할) 검색용 핵심 키워드 추출 (stopword 제거)
 def extract_search_keywords(query: str, max_keywords: int = 4):
     """
     검색 키워드 후보를 뽑아냄.
@@ -208,12 +214,14 @@ def extract_search_keywords(query: str, max_keywords: int = 4):
             cleaned.append(n)
     return sorted(cleaned, key=lambda x: -len(x))[:max_keywords]
 
+# (역할) 문서 title을 파일 서빙 URL(/files/...)로 변환
 def build_document_url(title_val: str):
     """문서 title을 /files/... URL로 변환."""
     name = title_val if title_val.lower().endswith(".pdf") else f"{title_val}.pdf"
     encoded = urllib.parse.quote(unicodedata.normalize("NFC", name))
     return f"{BASE_DOCS_URL.rstrip('/')}/{encoded}"
 
+# (역할) 같은 문서(title)에서 최대 chunk 개수 제한 (컨텍스트 편향 방지)
 def limit_results_per_title(results: list, max_per_title: int = 2):
     """
     같은 문서(title)에서 너무 많은 chunk가 뽑히면 컨텍스트가 편향되므로 제한.
@@ -226,6 +234,7 @@ def limit_results_per_title(results: list, max_per_title: int = 2):
             counter[t] += 1
     return limited
 
+# (역할) (옵션) reranker 모델로 검색 결과 재정렬
 def rerank_results(query: str, results: list, top_n: int = 5):
     """
     (옵션) reranker가 켜져 있으면 검색 결과를 재정렬.
@@ -247,6 +256,7 @@ def rerank_results(query: str, results: list, top_n: int = 5):
 # 10) Query Rewrite (옵션)
 # - 질문을 "검색에 더 잘 걸리는 명사형"으로 바꿔 retrieval 품질을 올리는 용도
 # =========================================================
+# (역할) LLM으로 질문을 검색 친화형으로 재작성 (옵션)
 def rewrite_query_for_retrieval(original_query: str) -> str:
     if not QUERY_REWRITE_ENABLED:
         return original_query
@@ -264,6 +274,7 @@ def rewrite_query_for_retrieval(original_query: str) -> str:
 # 11) Retrieval (PostgreSQL + pgvector)
 # - 벡터 검색 + 키워드 검색 + phrase 매칭을 점수로 합산하는 하이브리드 검색
 # =========================================================
+# (역할) DB에서 질문과 관련된 문서 chunk들을 검색해 top 결과를 반환
 def get_internal_context(query: str):
     # (1) 질문을 임베딩 벡터로 변환
     with embedding_lock:
@@ -339,6 +350,7 @@ def get_internal_context(query: str):
 # 12) Prompt Builder
 # ⚠️ 형님 요청: 프롬프트는 수정하지 않음 (원본 그대로)
 # =========================================================
+# (역할) 검색된 context를 넣어 최종 LLM 프롬프트 문자열을 생성
 def build_answer_prompt(original_query: str, effective_query: str, context: str) -> str:
     return (
         f"지식 데이터를 근거로 답변하세요. 모르면 모른다고 하세요.\n\n"
@@ -351,13 +363,16 @@ def build_answer_prompt(original_query: str, effective_query: str, context: str)
 # 13) LangGraph Nodes
 # - rewrite -> retrieve -> prepare 순서로 state를 누적
 # =========================================================
+# (역할) 파이프라인 1단계: 질문을 검색용으로 재작성
 def rewrite_query_node(state: PipelineState):
     return {"effective_query": rewrite_query_for_retrieval(state["original_query"])}
 
+# (역할) 파이프라인 2단계: DB에서 관련 문서 chunk 검색
 def retrieve_context_node(state: PipelineState):
     query = state.get("effective_query") or state["original_query"]
     return {"search_results": get_internal_context(query)}
 
+# (역할) 파이프라인 3단계: context/prompt/doc_links를 조립
 def prepare_prompt_node(state: PipelineState):
     results = state.get("search_results", [])
 
@@ -373,6 +388,7 @@ def prepare_prompt_node(state: PipelineState):
         "doc_links": links
     }
 
+# (역할) LangGraph로 rewrite->retrieve->prepare 실행 흐름을 구성하고 컴파일
 def create_rag_pipeline():
     graph = StateGraph(PipelineState)
     graph.add_node("rewrite_query", rewrite_query_node)
@@ -396,6 +412,7 @@ rag_pipeline = create_rag_pipeline()
 # - /feedback : 사용자 피드백을 DB에 임베딩으로 저장(학습/개선용)
 # =========================================================
 class RAGHandler(BaseHTTPRequestHandler):
+    # (역할) 일반 JSON 응답을 반환하는 헬퍼
     def _send_json(self, status_code, payload):
         """일반 JSON 응답."""
         self.send_response(status_code)
@@ -404,11 +421,13 @@ class RAGHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
+    # (역할) SSE 이벤트 한 번을 전송하는 헬퍼
     def _send_sse(self, data):
         """SSE(Server-Sent Events)로 한 이벤트 전송."""
         self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8"))
         self.wfile.flush()
 
+    # (역할) GET 요청 라우팅: /files, /search 처리
     def do_GET(self):
         parsed = urlparse(self.path)
 
@@ -476,6 +495,7 @@ class RAGHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_sse({"error": str(e)})
 
+    # (역할) POST 요청 라우팅: /feedback 처리
     def do_POST(self):
         # -----------------------------
         # (C) /feedback 저장
@@ -489,6 +509,7 @@ class RAGHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
 
+    # (역할) 사용자 피드백을 임베딩 후 DB에 저장
     def _save_feedback(self, q, a):
         """feedback을 임베딩해서 TABLE_NAME에 저장."""
         text = f"질문: {q}\n답변: {a}"

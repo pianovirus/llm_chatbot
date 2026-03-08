@@ -7,12 +7,11 @@ import warnings
 import ssl
 import threading
 from http.server import ThreadingHTTPServer
-from typing import TypedDict, List, Dict, Any
 
 from config import *
-from text_utils import safe_single_line
+from server import make_handler
 from retrieval import get_internal_context
-from server import make_handler  # ✅ RAGHandler 분리
+from pipeline import create_rag_pipeline  # ✅ pipeline 분리
 
 warnings.filterwarnings("ignore")
 
@@ -24,13 +23,12 @@ except AttributeError:
 else:
     ssl._create_default_https_context = _create_unverified_https_context
 
-# ✅ main.py는 "조립자" 역할만: 모델/그래프 초기화 + 서버 실행에 필요한 최소 import만 유지
+# ✅ main.py는 "조립자": 모델 초기화 + 파이프라인 조립 + 서버 실행
 from langchain_community.llms import Ollama
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from langgraph.graph import StateGraph, START, END
 
 # storage 폴더 준비
 STORAGE_DIR = os.path.join(os.getcwd(), "storage")
@@ -75,42 +73,9 @@ print(f"현재 선택된 모델명: {MODEL_NAME}")
 print(f"실제 생성된 객체 타입: {type(llm)}")
 print("=" * 50)
 
-class PipelineState(TypedDict, total=False):
-    original_query: str
-    effective_query: str
-    search_results: List[Dict[str, Any]]
-    context_combined: str
-    prompt: str
-    doc_links: Dict[str, str]
-
-def rewrite_query_for_retrieval(original_query: str) -> str:
-    if not QUERY_REWRITE_ENABLED:
-        return original_query
-    prompt = f"사용자 질문을 검색용 명사 위주 키워드로 요약하세요. 결과만 한 줄로 출력.\n질문: {original_query}"
-    try:
-        with llm_lock:
-            rewritten = llm.invoke(prompt)
-        content = rewritten.content if hasattr(rewritten, 'content') else str(rewritten)
-        return safe_single_line(content)
-    except:
-        return original_query
-
-# ⚠️ 프롬프트 수정 금지 유지
-def build_answer_prompt(original_query: str, effective_query: str, context: str) -> str:
-    return (
-        f"지식 데이터를 근거로 답변하세요. 모르면 모른다고 하세요.\n\n"
-        f"[질문]: {original_query}\n"
-        f"[데이터]:\n{context}\n\n"
-        f"응답은 반드시 [## 📢 조치 안내], [### 🛠️ 상세 절차], [### 💡 주의 사항] 순서로 작성하세요."
-    )
-
-def rewrite_query_node(state: PipelineState):
-    return {"effective_query": rewrite_query_for_retrieval(state["original_query"])}
-
-def retrieve_context_node(state: PipelineState):
-    q = state.get("effective_query") or state["original_query"]
-    results = get_internal_context(
-        q,
+# (역할) retrieval.get_internal_context에 넘길 kwargs를 매번 같은 형태로 만들어주는 빌더
+def build_retrieval_kwargs():
+    return dict(
         embed_model=embed_model,
         embedding_lock=embedding_lock,
         db_config=DB_CONFIG,
@@ -123,32 +88,15 @@ def retrieve_context_node(state: PipelineState):
         reranker=reranker,
         rerank_lock=rerank_lock,
     )
-    return {"search_results": results}
 
-def prepare_prompt_node(state: PipelineState):
-    results = state.get("search_results", [])
-    context = "\n".join([f"제목: {r['title']}\n내용: {r['content']}" for r in results])
-    links = {r["title"]: r["url"] for r in results if r.get("url")}
-    return {
-        "context_combined": context,
-        "prompt": build_answer_prompt(state["original_query"], state.get("effective_query", ""), context),
-        "doc_links": links
-    }
-
-def create_rag_pipeline():
-    graph = StateGraph(PipelineState)
-    graph.add_node("rewrite_query", rewrite_query_node)
-    graph.add_node("retrieve_context", retrieve_context_node)
-    graph.add_node("prepare_prompt", prepare_prompt_node)
-
-    graph.add_edge(START, "rewrite_query")
-    graph.add_edge("rewrite_query", "retrieve_context")
-    graph.add_edge("retrieve_context", "prepare_prompt")
-    graph.add_edge("prepare_prompt", END)
-    
-    return graph.compile()
-
-rag_pipeline = create_rag_pipeline()
+# ✅ pipeline 조립 (LangGraph)
+rag_pipeline = create_rag_pipeline(
+    llm=llm,
+    llm_lock=llm_lock,
+    query_rewrite_enabled=QUERY_REWRITE_ENABLED,
+    get_internal_context_fn=get_internal_context,
+    retrieval_kwargs_builder=build_retrieval_kwargs,
+)
 
 if __name__ == "__main__":
     print(f"📡 {LLM_PROVIDER.upper()} 기반 RAG 가동: http://localhost:8000")

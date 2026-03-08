@@ -96,3 +96,361 @@ EMBEDDING_DIMENSION=384
 
 BASE_DOCS_URL=http://localhost:8000/files/
 ```
+
+# agent_core.py 이해 가이드
+
+## 1. 현재 상태에 대한 이해
+
+현재 `agent_core.py`는 하나의 큰 파일이지만 실제로는 여러 시스템 역할이 합쳐진 구조입니다.
+
+파일을 나누지 못하는 것은 이상한 일이 아닙니다.
+
+지금 단계는 **리팩토링 단계가 아니라 이해 단계**입니다.
+
+파일 분리의 실제 순서는 다음과 같습니다.
+
+```
+이해 → 구조 인식 → 정리 → 파일 분리
+```
+
+지금은 **구조 인식 단계**입니다.
+
+---
+
+# 2. 파일 분리가 어려운 이유
+
+## 2.1 전역 객체 공유
+
+여러 함수가 다음 객체들을 공유하고 있습니다.
+
+```python
+embed_model
+reranker
+llm
+llm_chain
+rag_pipeline
+```
+
+이 객체들은 시스템 전체에서 사용되기 때문에  
+파일을 분리하면 초기화 순서나 import 문제가 생길 수 있다는 불안이 생깁니다.
+
+---
+
+## 2.2 HTTP 서버가 전체 시스템을 직접 사용
+
+`RAGHandler` 내부에서 다음 객체들을 직접 사용합니다.
+
+- rag_pipeline
+- llm_chain
+- embed_model
+
+그래서 파일을 나누면 다음과 같은 고민이 생깁니다.
+
+```
+어디서 import 해야 하지?
+```
+
+이 역시 정상적인 상황입니다.
+
+---
+
+# 3. 지금 필요한 것은 파일 분리가 아니다
+
+현재 필요한 작업은 **파일 분리**가 아니라 **함수 지도 만들기**입니다.
+
+즉 코드 수정 없이 다음 질문에 답하는 것입니다.
+
+```
+이 함수는 무슨 역할인가?
+```
+
+---
+
+# 4. agent_core.py 함수 역할 지도
+
+## 시스템 초기화
+
+### get_llm()
+
+LLM provider에 따라 모델 객체를 생성합니다.
+
+- Gemini
+- OpenAI
+- Ollama
+
+---
+
+## 텍스트 유틸리티
+
+### safe_single_line()
+
+문자열을 한 줄로 정리합니다.
+
+---
+
+### normalize_keyword()
+
+한국어 조사 등을 제거하여 검색 키워드를 정리합니다.
+
+예
+
+```
+연차신청은 → 연차신청
+```
+
+---
+
+### make_compact_query()
+
+검색을 위해
+
+- 특수문자 제거
+- 공백 제거
+
+된 문자열을 생성합니다.
+
+---
+
+### generate_phrase_candidates()
+
+검색을 위한 phrase 후보를 생성합니다.
+
+```
+original
+compact
+spaced_phrase
+pair_phrase
+triple_phrase
+```
+
+---
+
+### extract_search_keywords()
+
+사용자 질문에서 핵심 검색 키워드를 추출합니다.
+
+불필요한 단어(stopwords)는 제거합니다.
+
+---
+
+## 문서 처리
+
+### build_document_url()
+
+문서 title을 기반으로 PDF URL을 생성합니다.
+
+---
+
+### limit_results_per_title()
+
+한 문서에서 너무 많은 chunk가 검색되는 것을 제한합니다.
+
+---
+
+## 검색 품질 개선
+
+### rerank_results()
+
+reranker 모델을 사용하여 검색 결과 순서를 재정렬합니다.
+
+---
+
+### rewrite_query_for_retrieval()
+
+사용자 질문을 검색 친화적인 질의로 변환합니다.
+
+예
+
+```
+휴가 신청 어떻게 해요?
+→ 휴가 신청 절차
+```
+
+---
+
+## 핵심 검색 함수
+
+### get_internal_context()
+
+이 시스템의 핵심 retrieval 함수입니다.
+
+다음 작업을 수행합니다.
+
+1. 질문 임베딩 생성
+2. 키워드 추출
+3. phrase 후보 생성
+4. PostgreSQL hybrid search 실행
+5. 결과 점수 계산
+6. 문서별 chunk 제한
+7. rerank 적용
+
+---
+
+## 답변 생성
+
+### build_answer_prompt()
+
+검색된 문서를 기반으로 LLM에 전달할 최종 프롬프트를 생성합니다.
+
+---
+
+# 5. LangGraph RAG 파이프라인
+
+### rewrite_query_node()
+
+사용자 질문을 검색용 질의로 변환합니다.
+
+---
+
+### retrieve_context_node()
+
+DB에서 관련 문서를 검색합니다.
+
+---
+
+### prepare_prompt_node()
+
+검색된 문서를 기반으로
+
+- context 생성
+- prompt 생성
+
+을 수행합니다.
+
+---
+
+### create_rag_pipeline()
+
+전체 RAG 파이프라인을 구성합니다.
+
+```
+rewrite_query
+→ retrieve_context
+→ prepare_prompt
+```
+
+---
+
+# 6. HTTP 서버
+
+## RAGHandler
+
+API 요청을 처리하는 서버 클래스입니다.
+
+---
+
+### _send_json()
+
+JSON 응답을 전송합니다.
+
+---
+
+### _send_sse()
+
+SSE 스트리밍 이벤트를 전송합니다.
+
+---
+
+### do_GET()
+
+다음 요청을 처리합니다.
+
+```
+/files
+/search
+```
+
+---
+
+# 7. /search 요청 처리 흐름
+
+전체 시스템 흐름
+
+```
+사용자 질문
+↓
+do_GET()
+↓
+rag_pipeline.stream()
+↓
+rewrite_query_node()
+↓
+retrieve_context_node()
+↓
+prepare_prompt_node()
+↓
+LLM 응답 생성
+↓
+SSE 스트리밍 반환
+```
+
+---
+
+# 8. RAG 핵심 함수
+
+이 시스템에서 가장 중요한 함수는 다음 세 가지입니다.
+
+```
+rewrite_query_for_retrieval
+get_internal_context
+build_answer_prompt
+```
+
+각 단계는 다음 역할을 합니다.
+
+```
+질문 정제
+→ 문서 검색
+→ 근거 기반 답변 생성
+```
+
+이 세 단계가 **RAG 시스템의 핵심 구조**입니다.
+
+---
+
+# 9. 이해 단계 체크리스트
+
+다음 질문에 답할 수 있으면 큰 그림을 이해한 상태입니다.
+
+1. 사용자 질문이 어디서 들어오는가
+2. 검색 질의는 어디서 변환되는가
+3. DB 검색은 어디서 수행되는가
+4. 최종 프롬프트는 어디서 만들어지는가
+
+---
+
+# 10. 현재 단계 목표
+
+현재 목표는 파일 분리가 아닙니다.
+
+현재 목표
+
+```
+각 함수가 어떤 역할을 하는지 이해한다
+```
+
+이 작업만으로도
+
+```
+막연한 공포 → 이해 가능한 구조
+```
+
+로 바뀝니다.
+
+---
+
+# 11. 중요한 사실
+
+파일을 나눌 수 있어야 코드를 이해한 것이 아닙니다.
+
+실제 순서는 다음과 같습니다.
+
+```
+함수 역할 이해
+→ 호출 흐름 이해
+→ 구조 인식
+→ 파일 분리
+```
+
+지금은 **구조 인식 단계**입니다.
+

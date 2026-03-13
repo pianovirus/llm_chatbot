@@ -9,7 +9,6 @@ export default function ChatPage() {
   const [currentStatus, setCurrentStatus] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });

@@ -89,11 +89,25 @@ def make_handler(
 
                     # 2) LangGraph 파이프라인 실행 (rewrite -> retrieve -> prepare)
                     for update in rag_pipeline.stream(state, stream_mode="updates"):
-                        self._send_sse({"status": "🔍 검색 중..."})
                         for node, out in update.items():
                             state.update(out)
-                            if node == "retrieve_context":
-                                self._send_sse({"status": f"🔍 검색 완료 ({len(state['search_results'])}건)"})
+                            
+                            # 1. 노드 이름에 따른 상태 메시지 결정
+                            if node == "rewrite_query":
+                                # 이 단계가 오래 걸리므로 '생각 중'이라는 뉘앙스를 더 강하게 줍니다.
+                                self._send_sse({"status": "🧠 질문의 핵심 키워드를 추출하고 있습니다 (Gemini 분석 중)..."})
+                                
+                            elif node == "retrieve_context":
+                                count = len(state.get("search_results", []))
+                                # 다음 노드(prepare_prompt)가 너무 빠르니 여기서 메시지를 합쳐서 내보냅니다.
+                                self._send_sse({
+                                    "status": f"🔍 지식 데이터 {count}건 검색 완료! 답변을 구성하기 위해 정리 중입니다..."
+                                })
+                                
+                            elif node == "prepare_prompt":
+                                # 이 단계는 너무 빠르므로 별도의 status 보다는 로그만 남기거나 
+                                # 생략해도 무방합니다. (이미 위에서 합쳐서 보냈으므로)
+                                pass
 
                     # 3) 상태: 답변 생성 시작
                     self._send_sse({"status": "🤖✨ 답변 생성 중..."})

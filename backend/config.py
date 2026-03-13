@@ -15,13 +15,13 @@ BASE_DOCS_URL = os.getenv("BASE_DOCS_URL", "http://localhost:8000/files/")
 DB_NAME = os.getenv("DB_NAME")
 
 # Query Rewrite 및 Reranker 설정
-QUERY_REWRITE_ENABLED = os.getenv("QUERY_REWRITE_ENABLED", "true").lower() == "true"
+QUERY_REWRITE_ENABLED = os.getenv("QUERY_REWRITE_ENABLED", "false").lower() == "false"
 QUERY_REWRITE_MAX_CHARS = int(os.getenv("QUERY_REWRITE_MAX_CHARS", "80"))
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() == "true"
 RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "5"))
 RERANK_CANDIDATE_LIMIT = int(os.getenv("RERANK_CANDIDATE_LIMIT", "20"))
-MAX_CHUNKS_PER_TITLE = int(os.getenv("MAX_CHUNKS_PER_TITLE", "2"))
+MAX_CHUNKS_PER_TITLE = int(os.getenv("MAX_CHUNKS_PER_TITLE", "1"))
 
 # PostgreSQL 연결 정보
 DB_CONFIG = {

@@ -2,6 +2,9 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+파이썬 배포 : https://huggingface.co/spaces/hyukjoo2/allthatask
+Next.js 배포 : https://vercel.com/all-that-ask/llm-chatbot
+
 First, run the development server:
 
 ```bash

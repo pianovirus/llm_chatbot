@@ -18,7 +18,7 @@ export default function ChatPage() {
   // 🚨 피드백 전송 함수
   const handleFeedback = async (index: number, query: string, answer: string) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/feedback`, {
+      const response = await fetch(`https://hyukjoo2-allthatask.hf.space/feedback`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query, answer }),
@@ -50,7 +50,7 @@ export default function ChatPage() {
     setCurrentStatus("서버 연결 중...");
 
     try {
-      const response = await fetch(`${API_BASE_URL}/search?query=${encodeURIComponent(userQuery)}`);
+      const response = await fetch(`https://hyukjoo2-allthatask.hf.space/search?query=${encodeURIComponent(userQuery)}`);
       if (!response.body) return;
 
       const reader = response.body.getReader();

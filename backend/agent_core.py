@@ -235,7 +235,7 @@ def main():
         llm_provider=LLM_PROVIDER,
     )
 
-    ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", 7860), Handler).serve_forever()
 
 # ------------------------------------------------------------
 # 9) 실제 실행

@@ -9,6 +9,7 @@ export default function ChatPage() {
   const [currentStatus, setCurrentStatus] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -17,7 +18,7 @@ export default function ChatPage() {
   // 🚨 피드백 전송 함수
   const handleFeedback = async (index: number, query: string, answer: string) => {
     try {
-      const response = await fetch("http://localhost:8000/feedback", {
+      const response = await fetch(`${API_BASE_URL}/feedback`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query, answer }),
@@ -49,7 +50,7 @@ export default function ChatPage() {
     setCurrentStatus("서버 연결 중...");
 
     try {
-      const response = await fetch(`http://localhost:8000/search?query=${encodeURIComponent(userQuery)}`);
+      const response = await fetch(`${API_BASE_URL}/search?query=${encodeURIComponent(userQuery)}`);
       if (!response.body) return;
 
       const reader = response.body.getReader();

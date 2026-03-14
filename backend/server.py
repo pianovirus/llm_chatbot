@@ -27,8 +27,6 @@ def make_handler(
 ):
     """
     (역할) 의존성을 주입받아 RAGHandler 클래스를 만들어 반환하는 factory
-    - ThreadingHTTPServer(("",8000), HandlerClass) 형태로 넣기 위해 클래스가 필요함
-    - 이 방식으로 server.py <-> main.py 순환 import를 피함
     """
 
     class RAGHandler(BaseHTTPRequestHandler):
@@ -70,7 +68,6 @@ def make_handler(
 
             # -----------------------------
             # (B) /search?query=... 실행
-            # - SSE로 진행 상태(status) + 답변(chunk) 스트리밍
             # -----------------------------
             if parsed.path == "/search":
                 query = parse_qs(parsed.query).get("query", [""])[0].strip()
@@ -81,61 +78,54 @@ def make_handler(
                 self.end_headers()
 
                 try:
-                    # 1) 상태: 질문 요약 단계
-                    self._send_sse({"status": "🧠🔗⚙️ 질문 요약 중..."})
+                    # [단계 1] 시작 알림 (Gemini 요약 시작)
+                    self._send_sse({"status": "🧠 질문의 의도를 분석하고 있습니다..."})
 
-                    # 파이프라인 state 시작값
                     state = {"original_query": query}
 
-                    # 2) LangGraph 파이프라인 실행 (rewrite -> retrieve -> prepare)
+                    # [단계 2] 파이프라인 스트리밍
+                    # stream_mode="updates"는 노드가 '종료'될 때 이벤트를 줍니다.
                     for update in rag_pipeline.stream(state, stream_mode="updates"):
                         for node, out in update.items():
-                            state.update(out)
                             
-                            # 1. 노드 이름에 따른 상태 메시지 결정
                             if node == "rewrite_query":
-                                # 이 단계가 오래 걸리므로 '생각 중'이라는 뉘앙스를 더 강하게 줍니다.
-                                self._send_sse({"status": "🧠 질문의 핵심 키워드를 추출하고 있습니다 (Gemini 분석 중)..."})
+                                # 분석 노드가 끝남 -> 즉시 검색 노드가 시작될 것임을 알림
+                                eq = out.get("effective_query", query)
+                                self._send_sse({"status": f"🔍 분석 완료! 키워드 [{eq}](으)로 지식 베이스를 탐색 중입니다..."})
                                 
                             elif node == "retrieve_context":
-                                count = len(state.get("search_results", []))
-                                # 다음 노드(prepare_prompt)가 너무 빠르니 여기서 메시지를 합쳐서 내보냅니다.
-                                self._send_sse({
-                                    "status": f"🔍 지식 데이터 {count}건 검색 완료! 답변을 구성하기 위해 정리 중입니다..."
-                                })
+                                # 검색 노드가 끝남 -> 다음인 정리(prepare) 단계 예고
+                                results = out.get("search_results", [])
+                                count = len(results)
+                                self._send_sse({"status": f"✅ 정보 {count}건을 찾았습니다. 답변 구성을 위해 내용을 정리합니다..."})
                                 
                             elif node == "prepare_prompt":
-                                # 이 단계는 너무 빠르므로 별도의 status 보다는 로그만 남기거나 
-                                # 생략해도 무방합니다. (이미 위에서 합쳐서 보냈으므로)
-                                pass
+                                # 프롬프트 준비 끝 -> 실제 LLM 답변 생성 예고
+                                self._send_sse({"status": "✍️ 정리가 완료되었습니다. 답변 작성을 시작합니다..."})
 
-                    # 3) 상태: 답변 생성 시작
-                    self._send_sse({"status": "🤖✨ 답변 생성 중..."})
+                            # 상태 업데이트는 항상 로그 전송 후에 수행
+                            state.update(out)
 
-                    # 4) LLM 답변을 chunk 단위로 스트리밍
+                    # [단계 3] 최종 LLM 답변 생성
+                    # stream 루프가 끝나고 실제 첫 글자가 나오기 전까지의 공백을 메워줍니다.
+                    self._send_sse({"status": "🤖 답변을 생성 중입니다..."})
+
                     for chunk in llm_chain.stream(state["prompt"]):
-                        self._send_sse({"status": "💬✍️ 답변 중..."})
                         if chunk:
                             self._send_sse({"chunk": chunk})
 
-                    # 5) 문서 링크가 있으면 답변 뒤에 붙여서 제공
+                    # [단계 4] 관련 문서 링크 추가
                     if state.get("doc_links"):
                         links = "\n".join([f"- [{t}]({u})" for t, u in state["doc_links"].items()])
                         self._send_sse({"chunk": f"\n\n---\n### 🔗 관련 문서\n{links}"})
 
-                    # 6) SSE 종료 시그널
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
 
                 except Exception as e:
                     self._send_sse({"error": str(e)})
 
-        # (역할) POST 요청 라우팅: /feedback 처리
         def do_POST(self):
-            # -----------------------------
-            # (C) /feedback 저장
-            # - 질문/답변을 하나의 텍스트로 만들고 임베딩해서 DB에 저장
-            # -----------------------------
             if self.path == "/feedback":
                 try:
                     data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
@@ -144,11 +134,9 @@ def make_handler(
                 except Exception as e:
                     self._send_json(500, {"error": str(e)})
 
-        # (역할) 사용자 피드백을 임베딩 후 DB에 저장
         def _save_feedback(self, q, a):
             text = f"질문: {q}\n답변: {a}"
             vec = embed_model.encode(text).tolist()
-
             conn = psycopg2.connect(**db_config)
             try:
                 register_vector(conn)

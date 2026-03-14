@@ -30,11 +30,16 @@ def make_handler(
     """
 
     class RAGHandler(BaseHTTPRequestHandler):
+        # (수정) 500 에러 방지를 위한 소켓 강제 종료 설정
+        protocol_version = "HTTP/1.1"
+        close_connection = True
+
         # (역할) 일반 JSON 응답을 반환하는 헬퍼
         def _send_json(self, status_code, payload):
             self.send_response(status_code)
             self.send_header("Content-type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Connection", "close") # 연결 고착 방지
             self.end_headers()
             self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
@@ -59,6 +64,7 @@ def make_handler(
                         mimetypes.guess_type(full_path)[0] or "application/octet-stream",
                     )
                     self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     with open(full_path, "rb") as f:
                         self.wfile.write(f.read())
@@ -75,6 +81,7 @@ def make_handler(
                 self.send_response(200)
                 self.send_header("Content-type", "text/event-stream; charset=utf-8")
                 self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Connection", "close")
                 self.end_headers()
 
                 try:

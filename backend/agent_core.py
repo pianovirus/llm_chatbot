@@ -235,7 +235,10 @@ def main():
         llm_provider=LLM_PROVIDER,
     )
 
-    ThreadingHTTPServer(("0.0.0.0", 7860), Handler).serve_forever()
+    # (수정) 500 세션 에러 방지를 위한 타임아웃 주입
+    httpd = ThreadingHTTPServer(("0.0.0.0", 7860), Handler)
+    httpd.timeout = 30 
+    httpd.serve_forever()
 
 # ------------------------------------------------------------
 # 9) 실제 실행

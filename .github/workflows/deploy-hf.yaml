@@ -1,33 +1,59 @@
 name: Deploy backend to Hugging Face
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
     paths:
       - 'backend/**'
+      - '.github/workflows/deploy-hf.yml'
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: GitHub 코드 가져오기
+      - name: Checkout GitHub repo
         uses: actions/checkout@v4
 
-      - name: Hugging Face Space에 backend만 업로드
+      - name: Show local files
+        run: |
+          echo "== repo root =="
+          ls -la
+          echo "== backend =="
+          ls -la backend || true
+
+      - name: Push backend-only files to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          set -eux
+
           git config --global user.email "action@github.com"
           git config --global user.name "GitHub Action"
 
           git clone https://oauth2:$HF_TOKEN@huggingface.co/spaces/hyukjoo2/allthatask hf-space
 
+          echo "== before clean =="
+          ls -la hf-space
+
           find hf-space -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
 
-          rsync -av backend/ hf-space/
+          echo "== after clean =="
+          ls -la hf-space
+
+          rsync -av --delete backend/ hf-space/
+
+          echo "== after copy =="
+          ls -la hf-space
 
           cd hf-space
+          git status
           git add .
-          git commit -m "auto deploy from github" || echo "No changes to commit"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Deploy backend from GitHub"
+            git push origin main
+          fi

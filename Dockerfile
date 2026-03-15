@@ -21,4 +21,4 @@ ENV PORT=7860
 ENV PYTHONUNBUFFERED=1
 
 # 6. 실행 (이제 /app 안에 agent_core.py가 들어있음)
-CMD ["python", "agent_core.py"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]

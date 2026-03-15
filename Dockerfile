@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # 3. 경로 주의! backend 폴더 안에 있는 파일을 가져와야 함
-COPY backend/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 4. backend 폴더의 모든 내용을 /app(현재 경로)으로 복사

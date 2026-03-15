@@ -13,12 +13,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 4. backend 폴더의 모든 내용을 /app(현재 경로)으로 복사
-COPY backend/ .
+COPY . .
 
 # 5. 환경 변수
 ENV PORT=7860
 ENV PYTHONUNBUFFERED=1
 
 # 6. 실행 (이제 /app 안에 agent_core.py가 들어있음)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["python", "agent_core.py"]
